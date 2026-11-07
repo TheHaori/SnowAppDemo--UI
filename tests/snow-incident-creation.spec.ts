@@ -7,7 +7,7 @@ dotenv.config({
   override: true,
 });
 
-test.use({ headless: false });
+test.use({ headless: false, actionTimeout: 60_000, navigationTimeout: 60_000 });
 test.setTimeout(300_000);
 
 type IncidentData = {
@@ -69,21 +69,38 @@ test.describe('ServiceNow incident management', () => {
     const incident = readIncidentData();
 
     // Navigate to the ServiceNow instance.
-    await page.goto(incident.url);
+    await page.goto(incident.url, { waitUntil: 'domcontentloaded' });
 
     // Enter the ServiceNow username and continue.
-    await page.getByRole('textbox', { name: /user(name)?/i }).fill(incident.username);
-    await page.getByRole('button', { name: /^next$/i }).click();
+    const usernameField = page.getByRole('textbox', { name: /user(name)?/i });
+    await expect(usernameField).toBeVisible({ timeout: 60_000 });
+    await usernameField.fill(incident.username);
+    const nextButton = page.getByRole('button', { name: /^next$/i });
+    await expect(nextButton).toBeVisible({ timeout: 60_000 });
+    await nextButton.click();
 
     // Enter the ServiceNow password and sign in.
-    await page.getByRole('textbox', { name: /password/i }).fill(incident.password);
-    await page.getByRole('button', { name: /log in|sign in/i }).click();
+    const passwordField = page.getByRole('textbox', { name: /password/i });
+    await expect(passwordField).toBeVisible({ timeout: 60_000 });
+    await passwordField.fill(incident.password);
+    const loginButton = page.getByRole('button', { name: /log in|sign in/i });
+    await expect(loginButton).toBeVisible({ timeout: 60_000 });
+    await loginButton.click();
 
     // Search for the Incident module.
     const navigatorFilter = page.getByRole('textbox', {
       name: /filter navigator|application navigator|search/i,
     });
-    await expect(navigatorFilter).toBeVisible({ timeout: 60_000 });
+    // After login the home page sometimes never finishes rendering. Reloading is
+    // safe here (nothing has been created yet), so reload and wait again.
+    await expect(async () => {
+      try {
+        await expect(navigatorFilter).toBeVisible({ timeout: 25_000 });
+      } catch (error) {
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        throw error;
+      }
+    }).toPass({ timeout: 60_000, intervals: [0] });
     await navigatorFilter.fill('incident');
 
     // Open Incident and choose Create New.
@@ -96,40 +113,73 @@ test.describe('ServiceNow incident management', () => {
     await expect(createNewLink).toBeVisible({ timeout: 60_000 });
     await createNewLink.click();
 
+    // The incident form is rendered inside the ServiceNow content iframe.
+    const form = page.frameLocator('iframe#gsft_main');
+
     // Enter the caller and select the exact recent-selection match.
-    const callerField = page.getByRole('searchbox', { name: 'Caller', exact: true });
+    const callerField = form.locator('input[id="sys_display.incident.caller_id"]');
     await expect(callerField).toBeVisible({ timeout: 60_000 });
-    await callerField.fill(incident.caller);
-    const recentSelections = page.getByText('Recent selections', { exact: true });
-    await expect(recentSelections).toBeVisible({ timeout: 60_000 });
-    const callerMatch = page.getByText(incident.caller, { exact: true }).last();
+    // Wait for the form to render, then type the caller. The reference dropdown
+    // is attached by form scripts that can load late, so retry until it appears.
+    await form.locator('input[name="incident.short_description"]').waitFor({ timeout: 60_000 });
+    const callerDropdown = form.locator('[id="AC.incident.caller_id"]');
+    const recentSelections = callerDropdown.getByText('Recent selections', { exact: true });
+    await expect(async () => {
+      await callerField.click();
+      await callerField.fill('');
+      await callerField.pressSequentially(incident.caller, { delay: 100 });
+      await expect(recentSelections).toBeVisible({ timeout: 10_000 });
+    }).toPass({ timeout: 60_000 });
+    const callerMatch = callerDropdown.getByText(incident.caller, { exact: true });
     await expect(callerMatch).toBeVisible({ timeout: 60_000 });
     await callerMatch.click();
 
     // Enter the requested incident details.
-    const shortDescription = page.locator('input[name="short_description"]');
+    const shortDescription = form.locator('input[name="incident.short_description"]');
     await expect(shortDescription).toBeVisible({ timeout: 60_000 });
     await shortDescription.fill(incident.shortDescription);
-    const impact = page.locator('select[name="impact"]');
+    const impact = form.locator('select[name="incident.impact"]');
     await expect(impact).toBeVisible({ timeout: 60_000 });
     await impact.selectOption(incident.impact);
-    const urgency = page.locator('select[name="urgency"]');
+    const urgency = form.locator('select[name="incident.urgency"]');
     await expect(urgency).toBeVisible({ timeout: 60_000 });
     await urgency.selectOption(incident.urgency);
-    const comments = page.locator('textarea[name="comments"]');
+    const comments = form.locator('textarea[name="incident.comments"]');
     await expect(comments).toBeVisible({ timeout: 60_000 });
     await comments.fill(incident.comments);
 
     // Submit exactly once and verify the created incident.
-    const submitButton = page.getByRole('button', { name: /submit|save/i });
+    const submitButton = form.getByRole('button', { name: 'Submit', exact: true }).first();
     await expect(submitButton).toBeVisible({ timeout: 60_000 });
-    await submitButton.click();
-    const incidentNumber = page.locator('input[name="number"]');
+    // The number is generated when the form opens; capture it before submitting.
+    const incidentNumber = form.locator('input[name="incident.number"]');
     await expect(incidentNumber).toHaveValue(/^INC\d+$/, { timeout: 60_000 });
-    await expect(callerField).toHaveValue(incident.caller, { timeout: 60_000 });
-    await expect(shortDescription).toHaveValue(
+    const createdNumber = await incidentNumber.inputValue();
+    await submitButton.click();
+
+    // Wait until the new-record form is gone, which means the insert finished.
+    await expect(shortDescription).toBeHidden({ timeout: 60_000 });
+
+    // Reopen the saved record by its number and verify what was stored.
+    const recordUrl = new URL(
+      `/now/nav/ui/classic/params/target/${encodeURIComponent(
+        `incident.do?sysparm_query=number=${createdNumber}`,
+      )}`,
+      incident.url,
+    ).toString();
+    await page.goto(recordUrl);
+    const savedNumber = form.locator('input[name="incident.number"]');
+    await expect(savedNumber).toHaveValue(createdNumber, { timeout: 60_000 });
+    await expect(form.locator('input[id="sys_display.incident.caller_id"]')).toHaveValue(
+      incident.caller,
+      { timeout: 60_000 },
+    );
+    await expect(form.locator('input[name="incident.short_description"]')).toHaveValue(
       incident.shortDescription,
       { timeout: 60_000 },
     );
+
+    console.log(`Incident created: ${createdNumber}`);
+    test.info().annotations.push({ type: 'incident', description: createdNumber });
   });
 });
